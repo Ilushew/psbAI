@@ -1,13 +1,10 @@
 """
 embed.py — расчёт эмбеддингов для чанков из index/kb.db.
-Читает чанки, у которых dense_vec IS NULL, считает батчами и обновляет таблицу.
-Если процесс прервётся — следующий запуск продолжит с того места, где остановился.
-
-Запуск:
-    python rag/embed.py              # рассчитать эмбеддинги для всех чанков без векторов
-    python rag/embed.py --force      # пересчитать ВСЕ векторы заново
+Поддерживает возобновление: считает только строки, у которых dense_vec IS NULL.
+Использует MAX_WORKERS для параллельных запросов к API.
 """
 import argparse, json, os, re, sqlite3, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 INDEX_DIR = "index"
@@ -16,16 +13,15 @@ EMB_MODEL = os.getenv("EMB_MODEL", "BAAI/bge-m3")
 BATCH = 16
 
 
-def tokens(s: str):
-    """Простейший «стемминг» для русского: обрезка до 6 символов."""
+def _tokens(s: str):
     return [w[:6] for w in re.findall(r"[а-яёa-z0-9]+", s.lower())]
 
 
-def get_llm_client():
+def _llm():
     return OpenAI(base_url=os.environ["LLM_BASE_URL"], api_key=os.environ["LLM_API_KEY"])
 
 
-def embed_batch(cl, texts):
+def _embed_batch(cl, texts):
     for attempt in range(5):
         try:
             r = cl.embeddings.create(model=EMB_MODEL, input=texts)
@@ -37,9 +33,9 @@ def embed_batch(cl, texts):
     raise RuntimeError("не удалось получить эмбеддинги")
 
 
-def prepare_text(row):
-    """Восстанавливаем текст для эмбеддинга из колонок таблицы."""
-    c_id, doc, section, clause, text = row[0], row[3], row[4], row[5], row[9]
+def _prepare_text(row):
+    # row: (id, type, file, doc, section, clause, doc_date, is_amendment, lost, text)
+    c_id, _, _, doc, section, clause, _, _, _, text = row
     head = f"{doc} | {section}"
     if clause:
         head += f" | п.{clause}"
@@ -48,49 +44,60 @@ def prepare_text(row):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--force", action="store_true", help="пересчитать ВСЕ векторы заново")
+    ap.add_argument("--force", action="store_true", help="пересчитать ВСЕ векторы")
     args = ap.parse_args()
 
     if not os.path.exists(DB_PATH):
-        print(f"❌ База данных не найдена: {DB_PATH}", file=sys.stderr)
-        print("Сначала запустите: python rag/chunk.py", file=sys.stderr)
+        print(f"❌ База не найдена: {DB_PATH}. Сначала: python rag/chunk.py", file=sys.stderr)
         sys.exit(1)
 
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    # Выбираем чанки без векторов (или все, если --force)
     if args.force:
-        cur.execute("SELECT id, type, file, doc, section, clause, doc_date, is_amendment, lost, text FROM chunks")
+        rows = conn.execute(
+            "SELECT id, type, file, doc, section, clause, doc_date, is_amendment, lost, text FROM chunks"
+        ).fetchall()
     else:
-        cur.execute("SELECT id, type, file, doc, section, clause, doc_date, is_amendment, lost, text FROM chunks WHERE dense_vec IS NULL")
+        rows = conn.execute(
+            "SELECT id, type, file, doc, section, clause, doc_date, is_amendment, lost, text "
+            "FROM chunks WHERE dense_vec IS NULL"
+        ).fetchall()
+    conn.close()
 
-    rows = cur.fetchall()
     if not rows:
-        print("✅ Все чанки уже имеют векторы. Нечего считать.")
-        conn.close()
+        print("✅ Все чанки уже имеют векторы.")
         return
 
-    print(f"Нужно рассчитать эмбеддинги для {len(rows)} чанков...", file=sys.stderr)
-    llm = get_llm_client()
+    # Разбиваем на батчи
+    batches = [(i, rows[i:i + BATCH]) for i in range(0, len(rows), BATCH)]
+    workers = int(os.getenv("MAX_WORKERS", 4))
+    print(f"Чанков без векторов: {len(rows)}, батчей: {len(batches)}, воркеров: {workers}", file=sys.stderr)
 
-    for i in range(0, len(rows), BATCH):
-        part = rows[i:i + BATCH]
-        texts = [prepare_text(r) for r in part]
-        dense_vectors = embed_batch(llm, texts)
+    llm = _llm()
+    done = 0
 
+    def process_batch(start_idx, part):
+        texts = [_prepare_text(r) for r in part]
+        vecs = _embed_batch(llm, texts)
         updates = []
         for j, r in enumerate(part):
-            vec_json = json.dumps(dense_vectors[j])
-            sparse_str = " ".join(tokens(texts[j]))
-            updates.append((vec_json, sparse_str, r[0]))  # dense_vec, sparse_tokens, id
+            vec_json = json.dumps(vecs[j])
+            sparse_str = " ".join(_tokens(texts[j]))
+            updates.append((vec_json, sparse_str, r[0]))
+        return updates
 
-        cur.executemany("UPDATE chunks SET dense_vec=?, sparse_tokens=? WHERE id=?", updates)
-        conn.commit()
-        print(f"\r{min(i + BATCH, len(rows))}/{len(rows)}", end="", file=sys.stderr)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(process_batch, s, p) for s, p in batches]
+        # Собираем результаты и пишем в БД последовательно (чтобы не держать много коннектов)
+        conn = sqlite3.connect(DB_PATH)
+        for f in as_completed(futures):
+            updates = f.result()
+            conn.executemany("UPDATE chunks SET dense_vec=?, sparse_tokens=? WHERE id=?", updates)
+            conn.commit()
+            done += len(updates)
+            print(f"\r{done}/{len(rows)}", end="", file=sys.stderr)
+        conn.close()
 
-    conn.close()
-    print(f"\n✅ Готово! Векторы сохранены в {DB_PATH}", file=sys.stderr)
+    print(f"\n✅ Готово: {len(rows)} векторов сохранено в {DB_PATH}", file=sys.stderr)
 
 
 if __name__ == "__main__":
