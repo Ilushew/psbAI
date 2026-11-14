@@ -305,8 +305,8 @@ def chunk_company(text: str, file_stem: str):
 # ────────────────────────── сборка (1.1: пробрасываем part/context) ─────────────────────────
 def build_chunks():
     chunks = []
-    for p in sorted(Path(f"{DATA_DIR}/tmp/kb").rglob("*")):
-        if not p.is_file() or p.suffix.lower() == ".zip":
+    for p in sorted(Path(DATA_DIR).rglob("*")):
+        if not p.is_file() or p.suffix.lower() == ".zip" or p.name == "questions.csv":
             continue
         text = clean(read_file(p))
         if not text:

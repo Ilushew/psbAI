@@ -6,7 +6,7 @@ from openai import OpenAI
 from search_table import search, _llm
 from psbAI.search_table import search
 
-
+RERANK_MIN = float(os.getenv("RERANK_MIN_SCORE", 0.05))
 SYSTEM_PROMPT = """Ты — юридический ассистент компании ООО «ПСБ».
 Отвечай строго на основе документов из блока «КОНТЕКСТ».
 
@@ -68,7 +68,11 @@ def generate(query: str, rerank: bool = True) -> str:
         return "В предоставленной базе знаний информация отсутствует."
 
     # 4.2: проверка релевантности (если топ-1 имеет слишком низкий скор — контекст нерелевантен)
-    if chunks[0]["score"] < 0.01:
+    top = chunks[0]
+    if "rerank_score" in top:
+        if top["rerank_score"] < RERANK_MIN:
+            return "В предоставленной базе знаний информация отсутствует."
+    elif top["score"] < 0.01:  # реранкер недоступен или выключен — старая проверка
         return "В предоставленной базе знаний информация отсутствует."
 
     # 2. Промпт
