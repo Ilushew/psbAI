@@ -4,10 +4,10 @@ generate.py — генерация ответа с проверкой конте
 import argparse, os, sys, time
 from openai import OpenAI
 
-from search_table import search
+from psbAI.search_table import search
 
 
-SYSTEM_PROMPT = """Ты — юридический ассистент компании ООО «Меридиан».
+SYSTEM_PROMPT = """Ты — юридический ассистент компании ООО «ПСБ».
 Отвечай строго на основе документов из блока «КОНТЕКСТ».
 
 ПРАВИЛА:
@@ -104,7 +104,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
 
     if a.show_context:
-        from search_table import search as _search
+        from psbAI.search_table import search as _search
         top_k = int(os.getenv("TOP_K", 8))
         ctx = _search(a.query, k=top_k, rerank=not a.no_rerank)
         print(f"=== Контекст ({len(ctx)} чанков) ===")

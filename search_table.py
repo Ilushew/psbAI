@@ -1,7 +1,16 @@
 """
 search_table.py — гибридный поиск: Dense (cosine) + Sparse (BM25) + RRF + Reranker.
+
+Индекс загружается ОДИН раз за процесс:
+  * векторы -> нормализованная numpy-матрица (N x DIM), cosine = одно матричное умножение;
+  * BM25    -> для каждого терма заранее посчитаны вклады (idf * tf-часть) по документам,
+               запрос = сумма нескольких коротких numpy-массивов.
+Чанки без вектора (упавший батч эмбеддингов) не пропадают: у них нулевой вектор,
+и они находятся через BM25.
 """
-import json, math, os, re, sqlite3
+import json, math, os, re, sqlite3, sys, threading
+from collections import Counter
+
 import numpy as np
 from openai import OpenAI
 
@@ -10,168 +19,238 @@ DB_PATH = os.path.join(INDEX_DIR, "kb.db")
 EMB_MODEL = os.getenv("EMB_MODEL", "BAAI/bge-m3")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen3-Reranker-8B")
 
+K1, B = 1.5, 0.75
+RRF_K = 60
+DEFAULT_DIM = 1024  # bge-m3
+
+
+# ───────────────────────── клиент (один на процесс) ─────────────────────────
+_client = None
+_client_lock = threading.Lock()
+
 
 def _llm():
-    return OpenAI(base_url=os.environ["LLM_BASE_URL"], api_key=os.environ["LLM_API_KEY"])
+    """Общий потокобезопасный клиент: таймаут + несколько ретраев на 429/5xx."""
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                _client = OpenAI(
+                    base_url=os.environ["LLM_BASE_URL"],
+                    api_key=os.environ["LLM_API_KEY"],
+                    timeout=60,
+                    max_retries=2,
+                )
+    return _client
 
 
 def _tokens(s: str):
     return [w[:6] for w in re.findall(r"[а-яёa-z0-9]+", s.lower())]
 
 
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """3.1: cosine similarity с явной нормализацией."""
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+# ───────────────────────── индекс ─────────────────────────
+class _Index:
+    def __init__(self, db_path: str):
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(f"База не найдена: {db_path}")
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT id, type, file, doc, section, clause, doc_date, is_amendment, lost, "
+            "amends_doc, part, context, text, dense_vec, sparse_tokens FROM chunks"
+        ).fetchall()
+        conn.close()
+
+        self.n = len(rows)
+        self.chunks: list[dict] = []
+        tokens_all: list[list[str]] = []
+        vec_lists: list = []
+        dim = None
+
+        for r in rows:
+            (c_id, typ, file, doc, section, clause, doc_date, is_amend, lost,
+             amends_doc, part, context, text, vec_json, sparse_str) = r
+            self.chunks.append({
+                "id": c_id, "type": typ, "file": file, "doc": doc, "section": section,
+                "clause": clause, "doc_date": doc_date,
+                "is_amendment": bool(is_amend), "lost": bool(lost), "amends_doc": amends_doc,
+                "part": part, "context": context, "text": text,
+            })
+            tokens_all.append(sparse_str.split() if sparse_str else [])
+            if vec_json:
+                v = json.loads(vec_json)
+                dim = dim or len(v)
+                vec_lists.append(v)
+            else:
+                vec_lists.append(None)
+
+        # ---- dense: нормализованная матрица ----
+        dim = dim or DEFAULT_DIM
+        self.dim = dim
+        M = np.zeros((self.n, dim), dtype=np.float32)
+        missing = 0
+        for i, v in enumerate(vec_lists):
+            if v is not None and len(v) == dim:
+                M[i] = v
+            else:
+                missing += 1
+        norms = np.linalg.norm(M, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self.M = M / norms
+        if missing:
+            print(f"[index] чанков без вектора: {missing} (ищутся только через BM25)", file=sys.stderr)
+
+        # ---- BM25: предрасчёт вкладов терм -> (doc_idx, score) ----
+        dl = np.array([len(t) for t in tokens_all], dtype=np.float32)
+        avg_dl = float(dl.mean()) if self.n and dl.mean() > 0 else 1.0
+
+        postings: dict[str, tuple[list, list]] = {}
+        for i, toks in enumerate(tokens_all):
+            for t, f in Counter(toks).items():
+                p = postings.setdefault(t, ([], []))
+                p[0].append(i)
+                p[1].append(f)
+
+        self.bm25: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for t, (docs, tfs) in postings.items():
+            n_t = len(docs)
+            idf = math.log((self.n - n_t + 0.5) / (n_t + 0.5) + 1)
+            d = np.asarray(docs, dtype=np.int32)
+            f = np.asarray(tfs, dtype=np.float32)
+            w = idf * f * (K1 + 1) / (f + K1 * (1 - B + B * dl[d] / avg_dl))
+            self.bm25[t] = (d, w.astype(np.float32))
+
+        # ---- прочее ----
+        self.lost_penalty = np.array([0.3 if c["lost"] else 1.0 for c in self.chunks], dtype=np.float32)
+        self._textset_cache: dict[int, set] = {}
+        print(f"[index] загружено чанков: {self.n}, термов BM25: {len(self.bm25)}", file=sys.stderr)
+
+    # --- сорсинг ---
+    def bm25_scores(self, q_tokens: list[str]) -> np.ndarray:
+        s = np.zeros(self.n, dtype=np.float32)
+        for t in q_tokens:
+            e = self.bm25.get(t)
+            if e is not None:
+                s[e[0]] += e[1]
+        return s
+
+    def textset(self, i: int) -> set:
+        s = self._textset_cache.get(i)
+        if s is None:
+            s = set(_tokens(self.chunks[i]["text"]))
+            self._textset_cache[i] = s
+        return s
 
 
-def _bm25_score(query_tokens: list[str], doc_tokens: list[str], avg_dl: float, idf: dict, k1=1.5, b=0.75) -> float:
-    """3.2: BM25 с IDF и нормализацией по длине документа."""
-    dl = len(doc_tokens)
-    from collections import Counter
-    tf = Counter(doc_tokens)
-    score = 0.0
-    for t in query_tokens:
-        if t not in tf or t not in idf:
-            continue
-        f = tf[t]
-        num = f * (k1 + 1)
-        den = f + k1 * (1 - b + b * dl / avg_dl)
-        score += idf[t] * num / den
-    return score
+_index: _Index | None = None
+_index_lock = threading.Lock()
 
 
-def _compute_idf(all_docs_tokens: list[list[str]]) -> tuple[dict[str, float], float]:
-    """Считает IDF для BM25."""
-    N = len(all_docs_tokens)
-    df = {}
-    total_dl = 0
-    for doc in all_docs_tokens:
-        total_dl += len(doc)
-        for t in set(doc):
-            df[t] = df.get(t, 0) + 1
-    idf = {t: math.log((N - n + 0.5) / (n + 0.5) + 1) for t, n in df.items()}
-    avg_dl = total_dl / N if N > 0 else 1.0
-    return idf, avg_dl
+def get_index() -> _Index:
+    """Ленивая загрузка индекса (один раз, потокобезопасно)."""
+    global _index
+    if _index is None:
+        with _index_lock:
+            if _index is None:
+                _index = _Index(DB_PATH)
+    return _index
 
 
-def _deduplicate(items: list[dict], threshold=0.7) -> list[dict]:
-    """3.7: убираем чанки из одного файла с перекрытием текста > threshold."""
-    if not items:
-        return items
-    kept = []
-    for c in items:
-        is_dup = False
-        for k in kept:
-            if c["file"] == k["file"]:
-                # простое перекрытие по токенам
-                t1 = set(_tokens(c["text"]))
-                t2 = set(_tokens(k["text"]))
-                if not t1 or not t2:
-                    continue
-                overlap = len(t1 & t2) / min(len(t1), len(t2))
-                if overlap > threshold:
-                    is_dup = True
-                    break
-        if not is_dup:
-            kept.append(c)
+def reset_index():
+    global _index
+    with _index_lock:
+        _index = None
+
+
+# ───────────────────────── вспомогательное ─────────────────────────
+def _ranks(scores: np.ndarray) -> np.ndarray:
+    order = np.argsort(-scores, kind="stable")
+    r = np.empty(len(scores), dtype=np.float32)
+    r[order] = np.arange(len(scores), dtype=np.float32)
+    return r
+
+
+def _deduplicate(idx: _Index, cand: list[int], threshold=0.7) -> list[int]:
+    """Убираем чанки из одного файла с большим перекрытием текста."""
+    kept: list[int] = []
+    for i in cand:
+        dup = False
+        for j in kept:
+            if idx.chunks[i]["file"] != idx.chunks[j]["file"]:
+                continue
+            t1, t2 = idx.textset(i), idx.textset(j)
+            if not t1 or not t2:
+                continue
+            if len(t1 & t2) / min(len(t1), len(t2)) > threshold:
+                dup = True
+                break
+        if not dup:
+            kept.append(i)
     return kept
 
 
+# ───────────────────────── поиск ─────────────────────────
 def search(query: str, k: int | None = None, rerank: bool = False) -> list[dict]:
-    if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"База не найдена: {DB_PATH}")
-
     if k is None:
         k = int(os.getenv("TOP_K", 8))
 
-    llm = _llm()
-
-    # 1. Эмбеддинг запроса
-    q_emb = llm.embeddings.create(model=EMB_MODEL, input=[query]).data[0].embedding
-    q_vec = np.array(q_emb, dtype=np.float32)
-    q_tokens = _tokens(query)
-
-    # 2. Читаем все чанки
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT id, type, file, doc, section, clause, doc_date, is_amendment, lost, amends_doc, part, context, text, dense_vec, sparse_tokens "
-        "FROM chunks WHERE dense_vec IS NOT NULL"
-    ).fetchall()
-    conn.close()
-
-    if not rows:
+    idx = get_index()
+    if idx.n == 0:
         return []
 
-    # 3. Готовим данные для BM25
-    all_docs_tokens = [r[14].split() if r[14] else [] for r in rows]
-    idf, avg_dl = _compute_idf(all_docs_tokens)
+    llm = _llm()
 
-    # 4. Считаем гибридный скор
-    scored = []
-    for r in rows:
-        c_id, typ, file, doc, section, clause, doc_date, is_amend, lost, amends_doc, part, context, text, vec_json, sparse_str = r
-        c_vec = np.array(json.loads(vec_json), dtype=np.float32)
+    # 1. эмбеддинг запроса (единственный сетевой вызов до реранкера)
+    q = np.asarray(llm.embeddings.create(model=EMB_MODEL, input=[query]).data[0].embedding,
+                   dtype=np.float32)
+    qn = np.linalg.norm(q)
+    q = q / qn if qn else q
 
-        # 3.1: cosine similarity
-        dense = _cosine(q_vec, c_vec)
+    # 2. dense + sparse — векторизовано
+    dense = idx.M @ q
+    sparse = idx.bm25_scores(_tokens(query))
 
-        # 3.2: BM25
-        doc_tokens = sparse_str.split() if sparse_str else []
-        sparse = _bm25_score(q_tokens, doc_tokens, avg_dl, idf)
+    # 3. RRF
+    rrf = 1.0 / (RRF_K + _ranks(dense) + 1) + 1.0 / (RRF_K + _ranks(sparse) + 1)
 
-        # 3.3: RRF будет применён после сортировки по каждому из скоров
-        scored.append({
-            "id": c_id, "type": typ, "file": file, "doc": doc, "section": section,
-            "clause": clause, "doc_date": doc_date,
-            "is_amendment": bool(is_amend), "lost": bool(lost), "amends_doc": amends_doc,
-            "part": part, "context": context,
-            "text": text, "dense": dense, "sparse": sparse,
-        })
+    # 4. штраф за утратившие силу
+    final = rrf * idx.lost_penalty
 
-    # 3.3: RRF
-    scored.sort(key=lambda x: -x["dense"])
-    for rank, c in enumerate(scored):
-        c["rrf_dense"] = 1.0 / (60 + rank + 1)
-    scored.sort(key=lambda x: -x["sparse"])
-    for rank, c in enumerate(scored):
-        c["rrf_sparse"] = 1.0 / (60 + rank + 1)
-    for c in scored:
-        c["score"] = c["rrf_dense"] + c["rrf_sparse"]
+    # 5. кандидаты
+    n_cand = min(idx.n, k * 3)
+    top = np.argpartition(-final, n_cand - 1)[:n_cand] if n_cand < idx.n else np.arange(idx.n)
+    top = top[np.argsort(-final[top], kind="stable")]
+    top = _deduplicate(idx, [int(i) for i in top])
 
-    # 3.6: штраф за устаревшие документы
-    for c in scored:
-        if c["lost"]:
-            c["score"] *= 0.3
+    items = []
+    for i in top:
+        c = dict(idx.chunks[i])
+        c["dense"] = float(dense[i])
+        c["sparse"] = float(sparse[i])
+        c["score"] = float(final[i])
+        items.append(c)
 
-    scored.sort(key=lambda x: -x["score"])
-    top = scored[: k * 3]  # запас для реранкера
-
-    # 3.7: дедупликация
-    top = _deduplicate(top)
-
-    # 3.4: реранкер
+    # 6. реранкер
     if rerank:
-        top_n = int(os.getenv("RERANKER_TOP_N", k))
-        top = _rerank(llm, query, top, top_n)
+        items = _rerank(llm, query, items, int(os.getenv("RERANKER_TOP_N", k)))
 
-    return top[:k]
+    return items[:k]
 
 
 def _rerank(llm, query: str, items: list[dict], top_n: int) -> list[dict]:
     try:
         docs = [f"{c['doc']} | {c['section']}\n{c['text']}" for c in items]
-        r = llm.post(
-            "/rerank",
-            cast_to=object,
-            body={"model": RERANKER_MODEL, "query": query, "documents": docs},
-        )
+        r = llm.post("/rerank", cast_to=object,
+                     body={"model": RERANKER_MODEL, "query": query, "documents": docs})
         order = sorted(r["results"], key=lambda x: -x["relevance_score"])
-        return [items[o["index"]] for o in order][:top_n]
+        out = []
+        for o in order[:top_n]:
+            c = items[o["index"]]
+            c["rerank_score"] = float(o["relevance_score"])  # пригодится для порога отказа
+            out.append(c)
+        return out
     except Exception as e:
-        print(f"[rerank недоступен: {e!r}]")
+        print(f"[rerank недоступен: {e!r}]", file=sys.stderr)
         return items[:top_n]
 
 
