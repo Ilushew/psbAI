@@ -3,7 +3,7 @@ generate.py — генерация ответа с проверкой конте
 """
 import argparse, os, sys, time
 from openai import OpenAI
-
+from search_table import search, _llm
 from psbAI.search_table import search
 
 
@@ -78,7 +78,7 @@ def generate(query: str, rerank: bool = True) -> str:
     ]
 
     # 3. Запрос к LLM с retry
-    llm = OpenAI(base_url=os.environ["LLM_BASE_URL"], api_key=os.environ["LLM_API_KEY"])
+    llm = _llm()
     for attempt in range(3):
         try:
             resp = llm.chat.completions.create(
