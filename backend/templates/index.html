@@ -1,0 +1,103 @@
+
+{{ define "content" }}
+<div class="app">
+
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <div class="brand">
+                <div class="brand-icon">П</div>
+                <div>
+                    <div class="brand-name">ПСБ AI</div>
+                    <div class="brand-description">Юридический ассистент</div>
+                </div>
+            </div>
+
+            <button class="new-chat-button" id="new-chat">
+                <span>+</span>
+                Новый диалог
+            </button>
+        </div>
+
+        <div class="chats-section">
+            <div class="section-title">История диалогов</div>
+            <div class="chat-list" id="chat-list">
+                <div class="empty-chats">Загрузка диалогов...</div>
+            </div>
+        </div>
+
+        <div class="sidebar-footer">
+            <div class="user-avatar">П</div>
+            <div class="user-info">
+                <div class="user-name">ПСБ</div>
+                <div class="user-role">Корпоративный доступ</div>
+            </div>
+        </div>
+    </aside>
+
+    <main class="main">
+        <header class="topbar">
+            <div>
+                <div class="topbar-title">Юридический ассистент</div>
+                <div class="topbar-subtitle">Ответы на основе нормативной базы</div>
+            </div>
+            <div class="status">
+                <span class="status-dot"></span>
+                Система готова
+            </div>
+        </header>
+
+        <section class="conversation" id="conversation">
+            <div class="welcome" id="welcome">
+                <div class="welcome-icon">П</div>
+                <h1>Чем могу помочь?</h1>
+                <p>
+                    Задайте вопрос по законодательству,
+                    договорам или внутренним документам компании.
+                </p>
+
+                <div class="suggestions">
+                    <button class="suggestion"
+                        data-question="Какой срок рассмотрения претензии по договору?">
+                        <span>01</span>
+                        Какой срок рассмотрения претензии по договору?
+                    </button>
+
+                    <button class="suggestion"
+                        data-question="Какие документы необходимы для заключения договора?">
+                        <span>02</span>
+                        Какие документы необходимы для заключения договора?
+                    </button>
+
+                    <button class="suggestion"
+                        data-question="Какие требования предъявляются к дополнительным соглашениям?">
+                        <span>03</span>
+                        Какие требования предъявляются к дополнительным соглашениям?
+                    </button>
+                </div>
+            </div>
+
+            <div class="messages" id="messages"></div>
+        </section>
+
+        <footer class="composer-wrapper">
+            <form class="composer" id="message-form">
+                <textarea
+                    id="message-input"
+                    placeholder="Задайте вопрос..."
+                    rows="1"
+                    required
+                ></textarea>
+
+                <button type="submit" id="send-button" aria-label="Отправить">
+                    ↑
+                </button>
+            </form>
+
+            <div class="composer-hint">
+                Ответы формируются на основе документов базы знаний.
+            </div>
+        </footer>
+    </main>
+
+</div>
+{{ end }}
