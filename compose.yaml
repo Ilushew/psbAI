@@ -16,5 +16,51 @@ services:
       timeout: 3s
       retries: 5
 
+  ai-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.ai  # Создай этот файл (см. ниже)
+    container_name: legal-assistant-ai
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - DATA_DIR=/app/data
+      - TOP_K=8
+      - RERANK_MIN_SCORE=0.05
+    volumes:
+      - ./data:/app/data
+      - ./index:/app/index  # Если индекс уже построен локально
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: legal-assistant-backend
+    environment:
+      - SERVER_PORT=8080
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=legal_assistant
+      - SESSION_SECRET=${SESSION_SECRET:-super-secret-key}
+      - AI_SERVICE_URL=http://ai-service:8000
+      - AI_SERVICE_TIMEOUT=60s
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+
 volumes:
   postgres_data:

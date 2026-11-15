@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка curl для healthcheck
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем только нужные Python-файлы RAG
+COPY api.py .
+COPY generate.py .
+COPY search_table.py .
+COPY chunk.py .
+COPY embed.py .
+
+# Создаем директорию для индекса, если её нет
+RUN mkdir -p /app/index
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
