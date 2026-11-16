@@ -4,7 +4,7 @@ generate.py — генерация ответа с проверкой конте
 import argparse, os, sys, time
 from openai import OpenAI
 from search_table import search, _llm
-from psbAI.search_table import search
+from search_table import search
 
 RERANK_MIN = float(os.getenv("RERANK_MIN_SCORE", 0.05))
 SYSTEM_PROMPT = """Ты — юридический ассистент компании ООО «ПСБ».
