@@ -1,5 +1,149 @@
 # psbAI
 
+## Запуск проекта
+
+### Требования
+
+Для запуска необходимы:
+- Docker Engine
+- Docker Compose (плагин `docker compose`)
+- API-ключ OpenAI-совместимого LLM API
+
+### 1. Клонирование репозитория
+
+```bash
+git clone https://github.com/Ilushew/psbAI.git
+cd psbAI
+```
+
+### 2. Настройка окружения
+
+Создайте файл `.env` на основе примера:
+
+```bash
+cp .env.example .env
+```
+
+Добавьте в `.env` параметры подключения к LLM API:
+
+```env
+LLM_BASE_URL=https://your-api-provider/v1
+LLM_API_KEY=your-api-key
+LLM_MODEL=gpt-4o-mini
+```
+
+- `LLM_BASE_URL` — адрес OpenAI-совместимого API.
+- `LLM_API_KEY` — ключ доступа к API.
+- `LLM_MODEL` — модель для генерации ответов.
+
+API-провайдер должен поддерживать генерацию текста и создание эмбеддингов с использованием модели `BAAI/bge-m3` (размерность вектора — 1024). Для работы реранкера также желательно наличие совместимого endpoint `/rerank`; при его недоступности используется поиск без реранкинга.
+
+### 3. Подготовка базы знаний
+
+Поместите исходные документы в директорию `data/`.
+
+Поддерживаемые форматы: `.txt`, `.md`, `.json`, `.csv`, `.docx`, `.pdf`, `.html`.
+
+Если документы предоставлены архивом `knowledge-base.zip`, предварительно распакуйте его:
+
+```bash
+unzip data/knowledge-base.zip -d data/knowledge-base
+```
+
+### 4. Построение поискового индекса
+
+Создайте директорию для индекса:
+
+```bash
+mkdir -p index
+```
+
+Соберите Docker-образ AI Service:
+
+```bash
+docker compose build ai-service
+```
+
+Выполните нарезку документов на фрагменты:
+
+```bash
+docker compose run --rm ai-service python chunk.py
+```
+
+Создайте эмбеддинги для полученных фрагментов:
+
+```bash
+docker compose run --rm ai-service python embed.py
+```
+
+В результате будет создан индекс `index/kb.db`, используемый для поиска по базе знаний.
+
+### 5. Запуск приложения
+
+Запустите все сервисы:
+
+```bash
+docker compose up --build -d
+```
+
+Docker Compose автоматически запустит:
+- **PostgreSQL** — хранение пользовательских сессий, чатов и сообщений.
+- **AI Service** — поиск по базе знаний и генерация ответов.
+- **Go Backend** — HTTP API и веб-интерфейс.
+
+### 6. Проверка работы
+
+Проверьте состояние контейнеров:
+
+```bash
+docker compose ps
+```
+
+Проверьте доступность Backend:
+
+```bash
+curl http://localhost:8080/health
+```
+
+Ожидаемый ответ:
+
+```json
+{"status":"ok"}
+```
+
+### Адреса сервисов
+
+| Сервис | Адрес |
+|---|---|
+| Web-интерфейс | http://localhost:8080 |
+| Backend Health | http://localhost:8080/health |
+| AI Service Swagger | http://localhost:8000/docs |
+| PostgreSQL | localhost:5432 |
+
+### Управление приложением
+
+Просмотр логов всех сервисов:
+
+```bash
+docker compose logs -f
+```
+
+Просмотр логов отдельного сервиса:
+
+```bash
+docker compose logs -f backend
+docker compose logs -f ai-service
+docker compose logs -f postgres
+```
+
+Остановка приложения:
+
+```bash
+docker compose down
+```
+
+Данные PostgreSQL сохраняются в Docker Volume и не удаляются при обычной остановке контейнеров.
+
 RAG-ассистент по нормативной базе ООО «ПСБ»: законы и внутренние документы компании (регламенты, договоры, дополнительные соглашения). Отвечает на вопросы строго по содержимому базы знаний, со ссылками на статьи и пункты.
 
 ## Как это работает
